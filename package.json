@@ -1,0 +1,19 @@
+{
+  "name": "vector-search",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node ./bin/www"
+  },
+  "dependencies": {
+    "cookie-parser": "~1.4.4",
+    "debug": "~2.6.9",
+    "dotenv": "^16.4.7",
+    "express": "~4.16.1",
+    "http-errors": "~1.6.3",
+    "mongodb": "^6.14.2",
+    "morgan": "~1.9.1",
+    "openai": "^4.87.3",
+    "pug": "2.0.0-beta11"
+  }
+}
