@@ -2,7 +2,6 @@ var express = require('express');
 var router = express.Router();
 const { MongoClient } = require("mongodb");
 const OpenAI = require('openai');
-const { getEmbedding } = require('../functions/get-embeddings');
 require('dotenv').config();
 
 // connect to your Atlas deployment
@@ -55,90 +54,71 @@ router.get('/createEmbedding', async (req, res, next) => {
       { $unset: { plot_embedding: "" } }
     );
 
-    // Filter to exclude null or empty name fields
-    const filter = { 
-      "name": { "$exists": true, "$ne": "" }, 
-    };
-    
-    // Get a subset of documents from the collection
-    const documents = await collection.find(filter).toArray();
-    console.log(`Found ${documents.length} documents to process`);
-    
-    if (documents.length === 0) {
-      return res.json({
-        success: true,
-        message: 'No documents found to process'
-      });
-    }
+    // Get all recipes
+    const recipes = await collection.find({}).toArray();
+    console.log(`Found ${recipes.length} recipes to process`);
 
-    const updateDocuments = [];
     let processedCount = 0;
     let errorCount = 0;
 
-    // Process documents in batches of 10 to avoid overwhelming the API
-    const batchSize = 50;
-    for (let i = 0; i < documents.length; i += batchSize) {
-      const batch = documents.slice(i, i + batchSize);
-      await Promise.all(batch.map(async doc => {
-        try {
-          // Format the text for better semantic understanding
-          const textToEmbed = [
-            `Recipe: ${doc.name}`,
-          ].join('\n');
+    // Process each recipe
+    for (const recipe of recipes) {
+      try {
+        // Format the text for better semantic understanding
+        const textToEmbed = [
+          `Recipe: ${recipe.name}`,
+          `Ingredients: ${Array.isArray(recipe.ingredients) ? recipe.ingredients.join(', ') : recipe.ingredients}`,
+          `Steps: ${Array.isArray(recipe.steps) ? recipe.steps.join(' ') : recipe.steps}`
+        ].join('\n');
 
-          // Generate an embedding using the function that you defined
-          const embedding = await getEmbedding(textToEmbed);
-          
-          // Verify embedding format
-          if (!Array.isArray(embedding) || embedding.length !== 1536) {
-            throw new Error(`Invalid embedding format: ${JSON.stringify(embedding)}`);
-          }
+        // Generate embedding using OpenAI
+        const embeddingResponse = await openai.embeddings.create({
+          model: "text-embedding-ada-002",
+          input: textToEmbed,
+        });
 
-          // Add the embedding to an array of update operations
-          updateDocuments.push({
-            updateOne: {
-              filter: { "_id": doc._id },
-              update: { $set: { "plot_embedding": embedding } }
-            }
-          });
-          processedCount++;
-          console.log(`Processed document ${doc._id}: ${doc.name}`);
-        } catch (error) {
-          console.error(`Error processing document ${doc._id}:`, error);
-          errorCount++;
+        const embedding = embeddingResponse.data[0].embedding;
+
+        // Validate embedding format
+        if (!Array.isArray(embedding) || embedding.length !== 1536) {
+          throw new Error(`Invalid embedding format: ${JSON.stringify(embedding)}`);
         }
-      }));
 
-      console.log(`Processed ${processedCount}/${documents.length} documents`);
-    }
-    
-    if (updateDocuments.length > 0) {
-      // Update documents with the new embedding field
-      const result = await collection.bulkWrite(updateDocuments, { ordered: false });
-      console.log(`Successfully updated ${result.modifiedCount} documents`);
+        // Update the recipe with the embedding
+        await collection.updateOne(
+          { _id: recipe._id },
+          { $set: { plot_embedding: embedding } }
+        );
+
+        processedCount++;
+        if (processedCount % 10 === 0) {
+          console.log(`Processed ${processedCount} recipes...`);
+        }
+      } catch (error) {
+        console.error(`Error processing recipe ${recipe._id}:`, error);
+        errorCount++;
+      }
     }
 
-    // Verify some documents were updated
-    const updatedDocs = await collection.countDocuments({ plot_embedding: { $exists: true } });
-    console.log(`Total documents with embeddings: ${updatedDocs}`);
+    // Get final count of documents with embeddings
+    const finalCount = await collection.countDocuments({ plot_embedding: { $exists: true } });
 
     res.json({
       success: true,
-      message: 'Embeddings creation completed',
+      message: 'Embeddings created successfully',
       stats: {
-        totalDocuments: documents.length,
+        totalRecipes: recipes.length,
         processedCount,
         errorCount,
-        updatedCount: updateDocuments.length,
-        documentsWithEmbeddings: updatedDocs
+        finalCount
       }
     });
 
   } catch (error) {
-    console.error('Error creating embedding:', error);
+    console.error('Error creating embeddings:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to create embedding',
+      error: 'Failed to create embeddings',
       message: error.message,
       details: error
     });
@@ -303,17 +283,6 @@ router.post('/search', async (req, res, next) => {
       });
     }
 
-    // First, try to find the specific recipe
-    const specificRecipe = await collection.findOne({
-      name: "BBQ Field Peppers & Onions Stuffed with Spanakorizo"
-    });
-    console.log('Specific recipe found:', specificRecipe ? {
-      id: specificRecipe._id,
-      name: specificRecipe.name,
-      hasEmbedding: !!specificRecipe.plot_embedding,
-      embeddingLength: specificRecipe.plot_embedding ? specificRecipe.plot_embedding.length : 0
-    } : 'Not found');
-
     // Generate embedding for the search query using OpenAI
     let embedding;
     try {
@@ -410,6 +379,47 @@ router.post('/search', async (req, res, next) => {
     res.status(500).json({
       success: false,
       error: 'Failed to perform search',
+      message: error.message,
+      details: error
+    });
+  }
+});
+
+router.post('/reply', async (req, res, next) => {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('OPENAI_API_KEY environment variable is not set');
+    }
+
+    const {
+      conversationArr,      // array of conversation messages
+    } = req.body;
+
+    // Input validation
+    if (!Array.isArray(conversationArr) || conversationArr.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid conversation array',
+        message: 'conversationArr must be a non-empty array of messages'
+      });
+    }
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: conversationArr,
+      temperature: 0.7,
+      max_tokens: 1000
+    });
+
+    res.json({
+      success: true,
+      message: response.choices[0].message.content
+    });
+  } catch (error) {
+    console.error('Error in reply route:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process reply',
       message: error.message,
       details: error
     });
